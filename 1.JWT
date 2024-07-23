@@ -1,0 +1,555 @@
+1. JwtUtil 
+-------------------------------------------------------------------AS-IS-------------------------------------------------------------------
+@Component
+@RequiredArgsConstructor
+@Log4j2
+public class JwtUtil {
+
+    @Value("${jwt.secret}")
+    private String secretKey;
+    @Value("${jwt.acessExp}")
+    private long ACESS_TOKEN_TIME;
+    @Value("${jwt.refreshExp}")
+    private long REFRESH_TOKEN_TIME;
+
+    private Key getSigningKey() {
+        byte[] keyBytes = Base64.getDecoder().decode(secretKey);
+        return new SecretKeySpec(keyBytes, SignatureAlgorithm.HS256.getJcaName());
+    }
+
+    public String generateAccessToken(UserDetails userDetails) {
+        Map<String, Object> claims = new HashMap<>();
+        return Jwts.builder()
+                .setClaims(claims)
+                .setSubject(userDetails.getUsername())
+                .setIssuedAt(new Date(System.currentTimeMillis()))
+                .setExpiration(new Date(System.currentTimeMillis() + ACESS_TOKEN_TIME))
+                .signWith(getSigningKey(), SignatureAlgorithm.HS256)
+                .compact();
+    }
+
+    public String generateRefreshToken(UserDetails userDetails) {
+        Map<String, Object> claims = new HashMap<>();
+        return Jwts.builder()
+                .setClaims(claims)
+                .setSubject(userDetails.getUsername())
+                .setIssuedAt(new Date(System.currentTimeMillis()))
+                .setExpiration(new Date(System.currentTimeMillis() + REFRESH_TOKEN_TIME))
+                .signWith(getSigningKey(), SignatureAlgorithm.HS256)
+                .compact();
+    }
+
+    private String generateToken(Authentication authentication, long validity) {
+        Map<String, Object> claims = new HashMap<>();
+        return Jwts.builder()
+                .setClaims(claims)
+                .setSubject(authentication.getName())
+                .setIssuedAt(new Date(System.currentTimeMillis()))
+                .setExpiration(new Date(System.currentTimeMillis() + validity))
+                .signWith(getSigningKey(), SignatureAlgorithm.HS256)
+                .compact();
+    }
+
+    private Claims getClaimsFromToken(String token) {
+        return Jwts.parserBuilder()
+                .setSigningKey(getSigningKey())
+                .build()
+                .parseClaimsJws(token)
+                .getBody();
+    }
+
+    public String getExtractUserId(String token) {
+        return getClaimsFromToken(token).getSubject();
+    }
+
+    public Date getExtractExpiration(String token) {
+        return getClaimsFromToken(token).getExpiration();
+    }
+
+    public boolean isTokenExpired(String token) {
+        return getClaimsFromToken(token).getExpiration().before(new Date());
+    }
+
+    public boolean validateToken(String token, UserDetails userDetails) {
+        final String userId = getExtractUserId(token);
+        return (userId.equals(userDetails.getUsername()) && !isTokenExpired(token));
+    }
+
+    public void setAuthentication(UserDetails userDetails, HttpServletRequest request) {
+        UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
+                userDetails, null, userDetails.getAuthorities());
+        authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+        SecurityContextHolder.getContext().setAuthentication(authentication);
+    }
+
+}
+
+-------------------------------------------------------------------TO-BE-------------------------------------------------------------------
+@Component
+@RequiredArgsConstructor
+@Log4j2
+public class JwtTokenProvider {
+
+    private final RedisTemplate<String, String> redisTemplate;
+
+    @Value("${spring.jwt.secret}")
+    private String secretKey;
+
+    @Value("${spring.jwt.token.access-expiration-time}")
+    private long accessExpirationTime;
+
+    @Value("${spring.jwt.token.refresh-expiration-time}")
+    private long refreshExpirationTime;
+
+    @Autowired
+    private UserDetailsServiceImpl userDetailsService;
+
+    /**
+     * Access 토큰 생성
+     */
+    public String createAccessToken(Authentication authentication){
+        Claims claims = Jwts.claims().setSubject(authentication.getName());
+        Date now = new Date();
+        Date expireDate = new Date(now.getTime() + accessExpirationTime);
+
+        return Jwts.builder()
+                .setClaims(claims)
+                .setIssuedAt(now)
+                .setExpiration(expireDate)
+                .signWith(SignatureAlgorithm.HS256, secretKey)
+                .compact();
+    }
+
+    /**
+     * Refresh 토큰 생성
+     */
+    public String createRefreshToken(Authentication authentication){
+        Claims claims = Jwts.claims().setSubject(authentication.getName());
+        Date now = new Date();
+        Date expireDate = new Date(now.getTime() + refreshExpirationTime);
+
+        String refreshToken = Jwts.builder()
+                .setClaims(claims)
+                .setIssuedAt(now)
+                .setExpiration(expireDate)
+                .signWith(SignatureAlgorithm.HS256, secretKey)
+                .compact();
+
+        // redis에 저장
+        redisTemplate.opsForValue().set(
+                authentication.getName(),
+                refreshToken,
+                refreshExpirationTime,
+                TimeUnit.MILLISECONDS
+        );
+
+        return refreshToken;
+    }
+
+    /**
+     * 토큰으로부터 클레임을 만들고, 이를 통해 User 객체 생성해 Authentication 객체 반환
+     */
+    public Authentication getAuthentication(String token) {
+        String userPrincipal = Jwts.parser().
+                setSigningKey(secretKey)
+                .parseClaimsJws(token)
+                .getBody().getSubject();
+        UserDetails userDetails = userDetailsService.loadUserByUsername(userPrincipal);
+
+        return new UsernamePasswordAuthenticationToken(userDetails, "", userDetails.getAuthorities());
+    }
+
+    /**
+     * http 헤더로부터 bearer 토큰을 가져옴.
+     */
+    public String resolveToken(HttpServletRequest req) {
+        String bearerToken = req.getHeader("Authorization");
+        if (bearerToken != null && bearerToken.startsWith("Bearer ")) {
+            return bearerToken.substring(7);
+        }
+        return null;
+    }
+
+    /**
+     * Access 토큰을 검증
+     */
+    public boolean validateToken(String token){
+        try{
+            Jwts.parser().setSigningKey(secretKey).parseClaimsJws(token);
+            return true;
+        } catch(ExpiredJwtException e) {
+            log.error(EXPIRED_JWT.getMessage());
+            throw new BaseException(EXPIRED_JWT);
+        } catch(JwtException e) {
+            log.error(INVALID_JWT.getMessage());
+            throw new BaseException(INVALID_JWT);
+        }
+    }
+}
+
+2. JwtReqeustFilter
+
+-------------------------------------------------------------------AS-IS-------------------------------------------------------------------
+package com.project.mySite.component.filter;
+
+import com.project.mySite.component.Utils.JwtUtil;
+import com.project.mySite.component.security.MyUserDetailsService;
+import com.project.mySite.token.Token;
+import com.project.mySite.token.TokenService;
+import jakarta.servlet.http.Cookie;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.util.Optional;
+
+
+@Component
+public class JwtRequestFilter extends OncePerRequestFilter {
+
+    private final MyUserDetailsService myUserDetailsService;
+    private final JwtUtil jwtUtil;
+    private final TokenService tokenService;
+
+    @Autowired
+    public JwtRequestFilter(MyUserDetailsService myUserDetailsService, JwtUtil jwtUtil,TokenService tokenService) {
+        this.myUserDetailsService = myUserDetailsService;
+        this.jwtUtil = jwtUtil;
+        this.tokenService = tokenService;
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) throws ServletException {
+        String path = request.getRequestURI();
+        // 정적 리소스 경로 및 로그인/회원가입 경로를 필터링하지 않음
+        return path.startsWith("/css") || path.startsWith("/js") || path.startsWith("/img") ||
+                path.startsWith("/vendor") || path.startsWith("/favicon.ico") ||
+                path.startsWith("/static/css") || path.startsWith("/static/js") ||
+                path.startsWith("/static/img") || path.startsWith("/static/vendor") || path.startsWith("refresh-token");
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain) throws ServletException, IOException {
+
+        String requestPath = request.getRequestURI();
+        System.out.println("Request Path: " + requestPath);
+
+        String accessToken = null;
+        String refreshToken = null;
+        String userId = null;
+
+        // access토큰 로컬 스토리지에서 추출
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            accessToken = authHeader.substring(7);
+        }
+
+        // refreshToken 쿠키에서 추출
+        if (request.getCookies() != null) {
+                     for (Cookie cookie : request.getCookies()) {
+                if ("refreshToken".equals(cookie.getName())) {
+                    refreshToken = cookie.getValue();
+                }
+            }
+        }
+
+        if (refreshToken != null) {
+            System.out.println("Refresh Token is not null");
+             Optional<Token> optionalToken = tokenService.getTokenFromJwt(refreshToken);
+            if (optionalToken.isPresent() && tokenService.verifyExpiration(optionalToken.get()).isPresent()) {
+                System.out.println("Refresh Token is present and valid");
+            }
+           } else {
+            System.out.println("Refresh Token is invalid or expired");
+        }
+
+        // accessToken이 없거나, 인증 만료되었을 경우
+        if (accessToken == null || jwtUtil.isTokenExpired(accessToken)) {
+
+            // Access token이 만료된 경우, refresh token을 사용해 새로운 access token 발행 로직으로 넘어감
+            if (refreshToken != null) {
+                  Optional<Token> optionalToken = tokenService.getTokenFromJwt(refreshToken);
+
+                // refreshToken이 있는지?? null인지 유무 판단하며 만료되었을 경우 삭제 조치
+                 if (optionalToken.isPresent() && tokenService.verifyExpiration(optionalToken.get()).isPresent()) {
+
+                    // refreshToken으로부터 userId 추출 및 accessToken 재발급
+                    userId = jwtUtil.getExtractUserId(refreshToken);
+                    UserDetails userDetails = this.myUserDetailsService.loadUserByUsername(userId);
+                    String newAccessToken = jwtUtil.generateAccessToken(userDetails);
+
+                    // 새로운 Access Token을 JSON 응답으로 추가
+                    response.setContentType("application/json");
+                    response.getWriter().write("{\"accessToken\": \"" + newAccessToken + "\"}");
+
+                    // 토큰 spring 보안추가 및 저장
+                    jwtUtil.setAuthentication(userDetails,request);
+                }else{
+                    // RefreshToken이 유효하지 않을 경우
+                    invalidateCookie(response, "refreshToken");
+                    chain.doFilter(request, response);
+                    return;
+                }
+            } else {
+                // RefreshToken이 유효하지 않을 경우
+                invalidateCookie(response, "refreshToken");
+                chain.doFilter(request, response);
+                return;
+            }
+            
+        // accessToken이 있거나, 인증이 만료되지 않았을 경우
+        } else {
+            userId = jwtUtil.getExtractUserId(accessToken);
+
+            // userId이 있으며, 권한인증이 없을 경우 (로그인전, 세션이 만료, 서버 재시작, 필터체인 우회, 로그아웃)
+            if (userId != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+                UserDetails userDetails = myUserDetailsService.loadUserByUsername(userId);
+
+                // accessToken에서 userId와 DB에 있는 userId의 정보와 같은지 체크
+                if (jwtUtil.validateToken(accessToken, userDetails)) {
+                    jwtUtil.setAuthentication(userDetails,request);
+                }
+            }
+        }
+        // 로그인 및 회원가입 경로를 예외 처리
+        if (requestPath.equals("/user/login") || requestPath.equals("/user/register")) {
+            if (SecurityContextHolder.getContext().getAuthentication() != null) {
+                // 사용자가 이미 로그인된 경우
+                response.sendRedirect("/");
+                return;
+            } else {
+                response.sendRedirect(requestPath);
+                return;
+            }
+        }
+        chain.doFilter(request, response);
+    }
+
+    private void invalidateCookie(HttpServletResponse response, String cookieName) {
+        Cookie cookie = new Cookie(cookieName, null);
+        cookie.setHttpOnly(true);
+        cookie.setSecure(true);
+        cookie.setPath("/");
+        cookie.setMaxAge(0);
+        response.addCookie(cookie);
+    }
+
+    private void addCookie(HttpServletResponse response, String name, String value, int maxAge) {
+        Cookie cookie = new Cookie(name, value);
+        cookie.setHttpOnly(true);
+        cookie.setSecure(true);
+        cookie.setPath("/");
+        cookie.setMaxAge(maxAge);
+        response.addCookie(cookie);
+    }
+}
+
+
+
+
+-------------------------------------------------------------------TO-BE-------------------------------------------------------------------
+/**
+ * 헤더(Authorization)에 있는 토큰을 꺼내 이상이 없는 경우 SecurityContext에 저장
+ * Request 이전에 작동
+ */
+
+public class JwtFilter extends OncePerRequestFilter {
+    private final JwtTokenProvider jwtTokenProvider;
+
+    public JwtFilter(JwtTokenProvider jwtTokenProvider) {
+        this.jwtTokenProvider = jwtTokenProvider;
+    }
+
+    @Override
+    protected void doFilterInternal(
+            HttpServletRequest request,
+            HttpServletResponse response,
+            FilterChain filterChain
+    ) throws ServletException, IOException {
+        String token = jwtTokenProvider.resolveToken(request);
+        try {
+            if (token != null && jwtTokenProvider.validateToken(token)) {
+                Authentication auth = jwtTokenProvider.getAuthentication(token);
+                SecurityContextHolder.getContext().setAuthentication(auth); // 정상 토큰이면 SecurityContext에 저장
+            }
+        } catch (RedisConnectionFailureException e) {
+            SecurityContextHolder.clearContext();
+            throw new BaseException(REDIS_ERROR);
+        } catch (Exception e) {
+            throw new BaseException(INVALID_JWT);
+        }
+
+        filterChain.doFilter(request, response);
+    }
+}
+
+
+
+
+
+1. WebSecurityConfig
+
+-------------------------------------------------------------------AS-IS-------------------------------------------------------------------
+package com.project.mySite.config;
+
+import com.project.mySite.component.Utils.JwtUtil;
+import com.project.mySite.component.filter.JwtRequestFilter;
+import com.project.mySite.component.security.MyUserDetailsService;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.annotation.web.configurers.LogoutConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+
+@Configuration
+@EnableWebSecurity
+public class WebSecurityConfig {
+
+    private final MyUserDetailsService myUserDetailsService;
+    private final JwtRequestFilter jwtRequestFilter;
+
+    @Autowired
+    public WebSecurityConfig(MyUserDetailsService myUserDetailsService, JwtRequestFilter jwtRequestFilter) {
+        this.myUserDetailsService = myUserDetailsService;
+        this.jwtRequestFilter = jwtRequestFilter;
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http.csrf(AbstractHttpConfigurer::disable) // CSRF 보호 비활성화
+                .authorizeHttpRequests(authorizeRequests -> authorizeRequests
+                        .requestMatchers("/user/login", "/user/register", "/user/checkUser", "/email/send", "/email/verify" , "/refresh-token").permitAll() // 로그인 및 회원가입 경로 허용
+                        .requestMatchers("/css/**", "/img/**", "/js/**", "/scss/**", "/vendor/**", "/favicon.ico").permitAll() // 정적 파일 접근 허용
+                        .anyRequest().authenticated()
+                )
+                .sessionManagement(sessionManagement -> sessionManagement.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .formLogin(AbstractHttpConfigurer::disable) // 기본 폼 로그인을 비활성화
+                .logout(LogoutConfigurer::permitAll);
+                /*
+                .exceptionHandling(exceptionHandling -> exceptionHandling
+                        .authenticationEntryPoint((request, response, authException) -> {
+                            response.sendRedirect("/user/login");
+                        })
+                );
+                */
+
+
+        http.addFilterBefore(jwtRequestFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration authenticationConfiguration) throws Exception {
+        return authenticationConfiguration.getAuthenticationManager();
+    }
+
+    @Autowired
+    public void configureGlobal(AuthenticationManagerBuilder auth) throws Exception {
+        auth.userDetailsService(myUserDetailsService).passwordEncoder(passwordEncoder());
+    }
+
+    @Bean
+    public static PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+}
+
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------TO-BE-------------------------------------------------------------------
+
+
+
+
+
+
+
+
+1. JwtUtil   VS   JwtTokenProvider
+
+-------------------------------------------------------------------AS-IS-------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------TO-BE-------------------------------------------------------------------
+
+
+
+
+
+
+
+
+1. JwtUtil   VS   JwtTokenProvider
+
+-------------------------------------------------------------------AS-IS-------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------TO-BE-------------------------------------------------------------------
+
+
+
+
+
+
+
+
+1. JwtUtil   VS   JwtTokenProvider
+
+-------------------------------------------------------------------AS-IS-------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------TO-BE-------------------------------------------------------------------
+
+
+
+
+
+
+
+
